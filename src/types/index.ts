@@ -62,6 +62,7 @@ export interface PlaybackState {
 
 // Message types for communication between scripts
 export type MessageType =
+  | 'PING'
   | 'START_RECORDING'
   | 'STOP_RECORDING'
   | 'RECORD_STEP'

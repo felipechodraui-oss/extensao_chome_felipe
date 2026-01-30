@@ -2,36 +2,73 @@ import type { ElementSelector } from '../types';
 
 // Generate a unique CSS selector for an element
 export function generateCssSelector(element: Element): string {
-  // Try ID first
-  if (element.id) {
+  // Priority 1: ID (most reliable)
+  if (element.id && !element.id.includes(':')) {
     return `#${CSS.escape(element.id)}`;
   }
 
-  // Try data-testid or other test attributes
+  // Priority 2: data-testid (designed for testing)
   const testId = element.getAttribute('data-testid') || element.getAttribute('data-test-id');
   if (testId) {
     return `[data-testid="${CSS.escape(testId)}"]`;
   }
 
-  // Build a path from the element to root
+  // Priority 3: name attribute (common for form elements)
+  const name = element.getAttribute('name');
+  if (name) {
+    const tagName = element.tagName.toLowerCase();
+    return `${tagName}[name="${CSS.escape(name)}"]`;
+  }
+
+  // Priority 4: aria-label (accessibility attribute, usually stable)
+  const ariaLabel = element.getAttribute('aria-label');
+  if (ariaLabel && ariaLabel.length < 50) {
+    return `[aria-label="${CSS.escape(ariaLabel)}"]`;
+  }
+
+  // Priority 5: placeholder (for inputs)
+  const placeholder = element.getAttribute('placeholder');
+  if (placeholder && placeholder.length < 50) {
+    return `[placeholder="${CSS.escape(placeholder)}"]`;
+  }
+
+  // Priority 6: Build a path from the element to root
   const path: string[] = [];
   let current: Element | null = element;
+  let depth = 0;
+  const maxDepth = 5; // Limit path depth for robustness
 
-  while (current && current !== document.body) {
+  while (current && current !== document.body && depth < maxDepth) {
     let selector = current.tagName.toLowerCase();
 
-    // Add class names for specificity
+    // Try to add a unique identifier
+    if (current.id && !current.id.includes(':')) {
+      selector = `#${CSS.escape(current.id)}`;
+      path.unshift(selector);
+      break; // ID is unique, no need to go further
+    }
+
+    // Add meaningful class names (avoid dynamic/generated classes)
     if (current.className && typeof current.className === 'string') {
       const classes = current.className
         .split(' ')
-        .filter((c) => c.trim() && !c.includes(':'))
+        .filter((c) => {
+          const trimmed = c.trim();
+          // Filter out dynamic-looking classes
+          return trimmed &&
+            !trimmed.includes(':') &&
+            !trimmed.match(/^[a-z]{1,2}-/) && // Avoid Tailwind-like classes
+            !trimmed.match(/^\d/) && // Avoid classes starting with numbers
+            !trimmed.match(/^_/) && // Avoid underscore prefixed (CSS modules)
+            trimmed.length > 2; // Avoid very short classes
+        })
         .slice(0, 2);
       if (classes.length) {
         selector += '.' + classes.map((c) => CSS.escape(c)).join('.');
       }
     }
 
-    // Add nth-child if needed for uniqueness
+    // Add nth-of-type if needed for uniqueness
     const parentEl = current.parentElement;
     if (parentEl) {
       const currentTagName = current.tagName;
@@ -45,6 +82,7 @@ export function generateCssSelector(element: Element): string {
 
     path.unshift(selector);
     current = current.parentElement;
+    depth++;
   }
 
   return path.join(' > ');
@@ -207,9 +245,19 @@ function findByTextDeep(root: Document | Element | ShadowRoot, tagName: string, 
 
 // Find element using selector (tries multiple strategies)
 export function findElement(selector: ElementSelector): Element | null {
+  console.log('Flow Recorder: Finding element with selector:', {
+    css: selector.css,
+    xpath: selector.xpath,
+    text: selector.text,
+    tagName: selector.tagName,
+  });
+
   // Try CSS selector first (with Shadow DOM support)
   const elementByCss = querySelectorDeep(document, selector.css);
-  if (elementByCss) return elementByCss;
+  if (elementByCss) {
+    console.log('Flow Recorder: Found element via CSS selector');
+    return elementByCss;
+  }
 
   // Try XPath (doesn't support Shadow DOM, but try anyway)
   try {
@@ -221,28 +269,38 @@ export function findElement(selector: ElementSelector): Element | null {
       null
     );
     if (result.singleNodeValue) {
+      console.log('Flow Recorder: Found element via XPath');
       return result.singleNodeValue as Element;
     }
-  } catch {
-    // Invalid XPath
+  } catch (e) {
+    console.log('Flow Recorder: XPath evaluation failed:', e);
   }
 
   // Try finding by text content (with Shadow DOM support)
   if (selector.text) {
     const elementByText = findByTextDeep(document, selector.tagName, selector.text);
-    if (elementByText) return elementByText;
+    if (elementByText) {
+      console.log('Flow Recorder: Found element via text content');
+      return elementByText;
+    }
   }
 
   // Try finding by ID
   if (selector.attributes.id) {
     const elementById = document.getElementById(selector.attributes.id);
-    if (elementById) return elementById;
+    if (elementById) {
+      console.log('Flow Recorder: Found element via ID');
+      return elementById;
+    }
   }
 
   // Try finding by name attribute
   if (selector.attributes.name) {
-    const elementByName = document.querySelector(`[name="${CSS.escape(selector.attributes.name)}"]`);
-    if (elementByName) return elementByName;
+    const elementByName = querySelectorDeep(document, `[name="${CSS.escape(selector.attributes.name)}"]`);
+    if (elementByName) {
+      console.log('Flow Recorder: Found element via name attribute');
+      return elementByName;
+    }
   }
 
   // Try finding by aria-label
@@ -251,7 +309,10 @@ export function findElement(selector: ElementSelector): Element | null {
       document,
       `[aria-label="${CSS.escape(selector.attributes['aria-label'])}"]`
     );
-    if (elementByAria) return elementByAria;
+    if (elementByAria) {
+      console.log('Flow Recorder: Found element via aria-label');
+      return elementByAria;
+    }
   }
 
   // Try finding by placeholder
@@ -260,7 +321,33 @@ export function findElement(selector: ElementSelector): Element | null {
       document,
       `[placeholder="${CSS.escape(selector.attributes.placeholder)}"]`
     );
-    if (elementByPlaceholder) return elementByPlaceholder;
+    if (elementByPlaceholder) {
+      console.log('Flow Recorder: Found element via placeholder');
+      return elementByPlaceholder;
+    }
+  }
+
+  // Try finding by data-testid
+  if (selector.attributes['data-testid']) {
+    const elementByTestId = querySelectorDeep(
+      document,
+      `[data-testid="${CSS.escape(selector.attributes['data-testid'])}"]`
+    );
+    if (elementByTestId) {
+      console.log('Flow Recorder: Found element via data-testid');
+      return elementByTestId;
+    }
+  }
+
+  // Try finding by role + text combination
+  if (selector.attributes.role && selector.text) {
+    const elementsByRole = querySelectorAllDeep(document, `[role="${selector.attributes.role}"]`);
+    for (const el of elementsByRole) {
+      if (el.textContent?.trim() === selector.text) {
+        console.log('Flow Recorder: Found element via role + text');
+        return el;
+      }
+    }
   }
 
   // Last resort: find by tag and approximate text match
@@ -269,10 +356,34 @@ export function findElement(selector: ElementSelector): Element | null {
     for (const el of allByTag) {
       const elText = el.textContent?.trim() || '';
       if (elText.includes(selector.text) || selector.text.includes(elText)) {
+        console.log('Flow Recorder: Found element via approximate text match');
         return el;
       }
     }
   }
 
+  console.log('Flow Recorder: Element not found with any strategy');
+  return null;
+}
+
+// Find element with retry (for dynamic content)
+export async function findElementWithRetry(
+  selector: ElementSelector,
+  maxAttempts: number = 10,
+  intervalMs: number = 500
+): Promise<Element | null> {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const element = findElement(selector);
+    if (element) {
+      return element;
+    }
+
+    if (attempt < maxAttempts) {
+      console.log(`Flow Recorder: Element not found, attempt ${attempt}/${maxAttempts}. Retrying in ${intervalMs}ms...`);
+      await new Promise(resolve => setTimeout(resolve, intervalMs));
+    }
+  }
+
+  console.error('Flow Recorder: Element not found after all retries');
   return null;
 }

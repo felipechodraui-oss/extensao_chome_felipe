@@ -1,366 +1,465 @@
-import type { RecordedStep } from '../types';
-import { findElement } from '../utils/selectors';
+import type { RecordedStep, ElementSelector } from '../types';
 
-// Highlight element during playback
-function highlightElement(element: Element): () => void {
-  const originalOutline = (element as HTMLElement).style.outline;
-  const originalOutlineOffset = (element as HTMLElement).style.outlineOffset;
+// ============================================================================
+// CAPTCHA DETECTION
+// ============================================================================
 
-  (element as HTMLElement).style.outline = '3px solid #4CAF50';
-  (element as HTMLElement).style.outlineOffset = '2px';
+const CAPTCHA_SELECTORS = [
+  '.g-recaptcha', 'iframe[src*="recaptcha"]', 'iframe[title*="reCAPTCHA"]',
+  '#recaptcha', '[data-sitekey]', '.h-captcha', 'iframe[src*="hcaptcha"]',
+  '.cf-turnstile', 'iframe[src*="challenges.cloudflare.com"]',
+  '#funcaptcha', 'iframe[src*="funcaptcha"]',
+  '[class*="captcha"]', '[id*="captcha"]', 'img[src*="captcha"]',
+];
 
-  return () => {
-    (element as HTMLElement).style.outline = originalOutline;
-    (element as HTMLElement).style.outlineOffset = originalOutlineOffset;
-  };
+let lastCaptchaAlertTime = 0;
+const CAPTCHA_COOLDOWN_MS = 30000;
+
+export function detectCaptcha(): { detected: boolean; type: string | null } {
+  if (Date.now() - lastCaptchaAlertTime < CAPTCHA_COOLDOWN_MS) {
+    return { detected: false, type: null };
+  }
+
+  for (const selector of CAPTCHA_SELECTORS) {
+    try {
+      const elements = document.querySelectorAll(selector);
+      for (const element of elements) {
+        const rect = element.getBoundingClientRect();
+        const style = window.getComputedStyle(element);
+        if (rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden') {
+          let type = 'CAPTCHA';
+          if (selector.includes('recaptcha')) type = 'reCAPTCHA';
+          else if (selector.includes('hcaptcha')) type = 'hCaptcha';
+          else if (selector.includes('cloudflare')) type = 'Cloudflare Turnstile';
+          return { detected: true, type };
+        }
+      }
+    } catch { /* ignore */ }
+  }
+  return { detected: false, type: null };
 }
 
-// Get the center coordinates of an element
-function getElementCenter(element: Element): { x: number; y: number } {
+function showCaptchaAlert(captchaType: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.id = 'flow-recorder-captcha-overlay';
+    overlay.style.cssText = `position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:999999;display:flex;align-items:center;justify-content:center;font-family:sans-serif;`;
+    overlay.innerHTML = `
+      <div style="background:white;border-radius:12px;padding:24px 32px;max-width:400px;text-align:center;">
+        <div style="font-size:48px;">🤖</div>
+        <h2 style="margin:12px 0;color:#333;">CAPTCHA Detectado</h2>
+        <p style="color:#666;font-size:14px;">Detectamos um <strong>${captchaType}</strong>. Clique em "Vou Resolver" para ter 20 segundos.</p>
+        <div id="countdown" style="display:none;font-size:32px;font-weight:bold;color:#4CAF50;margin:16px 0;"></div>
+        <div id="buttons" style="display:flex;gap:12px;justify-content:center;margin-top:16px;">
+          <button id="resolve" style="background:#4CAF50;color:white;border:none;padding:12px 24px;border-radius:6px;cursor:pointer;">Vou Resolver</button>
+          <button id="stop" style="background:#f44336;color:white;border:none;padding:12px 24px;border-radius:6px;cursor:pointer;">Parar</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+
+    overlay.querySelector('#resolve')?.addEventListener('click', () => {
+      (overlay.querySelector('#buttons') as HTMLElement).style.display = 'none';
+      const countdown = overlay.querySelector('#countdown') as HTMLElement;
+      countdown.style.display = 'block';
+      let seconds = 20;
+      countdown.textContent = String(seconds);
+      const interval = setInterval(() => {
+        seconds--;
+        countdown.textContent = String(seconds);
+        if (seconds <= 0) {
+          clearInterval(interval);
+          overlay.remove();
+          lastCaptchaAlertTime = Date.now();
+          resolve(true);
+        }
+      }, 1000);
+    });
+
+    overlay.querySelector('#stop')?.addEventListener('click', () => {
+      overlay.remove();
+      resolve(false);
+    });
+  });
+}
+
+// ============================================================================
+// DEEP QUERY SELECTOR - Traverses Shadow DOM
+// ============================================================================
+
+/**
+ * Query selector that traverses ALL shadow roots recursively
+ */
+function deepQuerySelector(selector: string, root: Document | Element | ShadowRoot = document): Element | null {
+  // Try in current root
+  try {
+    const element = root.querySelector(selector);
+    if (element) return element;
+  } catch { /* invalid selector */ }
+
+  // Search in all shadow roots
+  const allElements = root.querySelectorAll('*');
+  for (const el of allElements) {
+    if ((el as HTMLElement).shadowRoot) {
+      const found = deepQuerySelector(selector, (el as HTMLElement).shadowRoot!);
+      if (found) return found;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Find element using shadow host path (format: "host1 >>> host2 >>> target")
+ */
+function findByShadowPath(hostPath: string, targetSelector: string): Element | null {
+  const hosts = hostPath.split(' >>> ').map(s => s.trim());
+  let currentRoot: Document | ShadowRoot = document;
+
+  for (const hostSelector of hosts) {
+    const hostElement: Element | null = currentRoot.querySelector(hostSelector);
+    if (!hostElement || !(hostElement as HTMLElement).shadowRoot) {
+      console.log('Flow Recorder: Shadow host not found:', hostSelector);
+      return null;
+    }
+    currentRoot = (hostElement as HTMLElement).shadowRoot!;
+  }
+
+  // Now search in the final shadow root
+  return currentRoot.querySelector(targetSelector);
+}
+
+/**
+ * Check if element is visible and interactable
+ */
+function isElementVisible(element: Element): boolean {
   const rect = element.getBoundingClientRect();
-  return {
-    x: rect.left + rect.width / 2,
-    y: rect.top + rect.height / 2,
-  };
+  if (rect.width === 0 || rect.height === 0) return false;
+
+  const style = window.getComputedStyle(element);
+  if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+
+  return true;
 }
 
-// Create a mouse event with all necessary properties
-function createMouseEvent(type: string, element: Element, coords: { x: number; y: number }): MouseEvent {
-  return new MouseEvent(type, {
-    bubbles: true,
-    cancelable: true,
-    view: window,
-    detail: type === 'dblclick' ? 2 : 1,
-    screenX: coords.x + window.screenX,
-    screenY: coords.y + window.screenY,
-    clientX: coords.x,
-    clientY: coords.y,
-    ctrlKey: false,
-    altKey: false,
-    shiftKey: false,
-    metaKey: false,
-    button: 0,
-    buttons: type === 'mouseup' ? 0 : 1,
-    relatedTarget: null,
-  });
+/**
+ * Wait for element to be visible with timeout
+ */
+async function waitForVisible(element: Element, timeoutMs: number = 5000): Promise<boolean> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (isElementVisible(element)) return true;
+    await new Promise(r => setTimeout(r, 100));
+  }
+  return false;
 }
 
-// Create pointer events (for modern sites)
-function createPointerEvent(type: string, element: Element, coords: { x: number; y: number }): PointerEvent {
-  return new PointerEvent(type, {
-    bubbles: true,
-    cancelable: true,
-    view: window,
-    detail: 1,
-    screenX: coords.x + window.screenX,
-    screenY: coords.y + window.screenY,
-    clientX: coords.x,
-    clientY: coords.y,
-    ctrlKey: false,
-    altKey: false,
-    shiftKey: false,
-    metaKey: false,
-    button: 0,
-    buttons: type === 'pointerup' ? 0 : 1,
-    pointerId: 1,
-    width: 1,
-    height: 1,
-    pressure: type === 'pointerup' ? 0 : 0.5,
-    tangentialPressure: 0,
-    tiltX: 0,
-    tiltY: 0,
-    twist: 0,
-    pointerType: 'mouse',
-    isPrimary: true,
-  });
+// ============================================================================
+// ELEMENT FINDER - Multiple strategies with Shadow DOM support
+// ============================================================================
+
+function findElement(selector: ElementSelector): Element | null {
+  console.log('Flow Recorder: Finding element:', selector);
+
+  // Strategy 1: Check for shadow host path
+  const shadowPath = selector.attributes['data-shadow-host-path'];
+  if (shadowPath) {
+    console.log('Flow Recorder: Using shadow path:', shadowPath);
+    const element = findByShadowPath(shadowPath, selector.css);
+    if (element) {
+      console.log('Flow Recorder: Found via shadow path');
+      return element;
+    }
+  }
+
+  // Strategy 2: Deep CSS selector (traverses shadow DOM)
+  const byCss = deepQuerySelector(selector.css);
+  if (byCss) {
+    console.log('Flow Recorder: Found via deep CSS');
+    return byCss;
+  }
+
+  // Strategy 3: XPath (doesn't work in shadow DOM, but try anyway)
+  try {
+    const result = document.evaluate(selector.xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+    if (result.singleNodeValue) {
+      console.log('Flow Recorder: Found via XPath');
+      return result.singleNodeValue as Element;
+    }
+  } catch { /* ignore */ }
+
+  // Strategy 4: By ID (with deep search)
+  if (selector.attributes.id) {
+    const byId = document.getElementById(selector.attributes.id) || deepQuerySelector(`#${selector.attributes.id}`);
+    if (byId) {
+      console.log('Flow Recorder: Found via ID');
+      return byId;
+    }
+  }
+
+  // Strategy 5: By name attribute
+  if (selector.attributes.name) {
+    const byName = deepQuerySelector(`[name="${selector.attributes.name}"]`);
+    if (byName) {
+      console.log('Flow Recorder: Found via name');
+      return byName;
+    }
+  }
+
+  // Strategy 6: By placeholder
+  if (selector.attributes.placeholder) {
+    const byPlaceholder = deepQuerySelector(`[placeholder="${selector.attributes.placeholder}"]`);
+    if (byPlaceholder) {
+      console.log('Flow Recorder: Found via placeholder');
+      return byPlaceholder;
+    }
+  }
+
+  // Strategy 7: By aria-label
+  if (selector.attributes['aria-label']) {
+    const byAria = deepQuerySelector(`[aria-label="${selector.attributes['aria-label']}"]`);
+    if (byAria) {
+      console.log('Flow Recorder: Found via aria-label');
+      return byAria;
+    }
+  }
+
+  // Strategy 8: By data-testid
+  if (selector.attributes['data-testid']) {
+    const byTestId = deepQuerySelector(`[data-testid="${selector.attributes['data-testid']}"]`);
+    if (byTestId) {
+      console.log('Flow Recorder: Found via data-testid');
+      return byTestId;
+    }
+  }
+
+  // Strategy 9: By text content
+  if (selector.text) {
+    const allByTag = Array.from(document.querySelectorAll(selector.tagName));
+    for (const el of allByTag) {
+      if (el.textContent?.trim() === selector.text) {
+        console.log('Flow Recorder: Found via text content');
+        return el;
+      }
+    }
+  }
+
+  console.log('Flow Recorder: Element not found with any strategy');
+  return null;
 }
 
-// Simulate a comprehensive click event (works with most frameworks)
+async function findElementWithRetry(selector: ElementSelector, maxAttempts: number = 10, intervalMs: number = 500): Promise<Element | null> {
+  for (let i = 0; i < maxAttempts; i++) {
+    const element = findElement(selector);
+    if (element) return element;
+    console.log(`Flow Recorder: Retry ${i + 1}/${maxAttempts}`);
+    await new Promise(r => setTimeout(r, intervalMs));
+  }
+  return null;
+}
+
+// ============================================================================
+// EVENT SIMULATION
+// ============================================================================
+
+function highlightElement(element: Element): () => void {
+  const el = element as HTMLElement;
+  const originalOutline = el.style.outline;
+  el.style.outline = '3px solid #4CAF50';
+  return () => { el.style.outline = originalOutline; };
+}
+
 function simulateClick(element: Element, position?: { x: number; y: number }): void {
-  const coords = position ?? getElementCenter(element);
-  const htmlElement = element as HTMLElement;
+  const el = element as HTMLElement;
+  el.scrollIntoView({ behavior: 'instant', block: 'center' });
 
-  // Focus the element first
-  if (htmlElement.focus) {
-    htmlElement.focus();
+  const rect = el.getBoundingClientRect();
+  const x = position?.x ?? rect.left + rect.width / 2;
+  const y = position?.y ?? rect.top + rect.height / 2;
+
+  console.log('Flow Recorder: Clicking at', x, y);
+
+  // Focus first
+  el.focus?.();
+
+  // Dispatch pointer and mouse events
+  const events = [
+    new PointerEvent('pointerdown', { bubbles: true, cancelable: true, composed: true, clientX: x, clientY: y }),
+    new MouseEvent('mousedown', { bubbles: true, cancelable: true, composed: true, clientX: x, clientY: y }),
+    new MouseEvent('mouseup', { bubbles: true, cancelable: true, composed: true, clientX: x, clientY: y }),
+    new MouseEvent('click', { bubbles: true, cancelable: true, composed: true, clientX: x, clientY: y }),
+    new PointerEvent('pointerup', { bubbles: true, cancelable: true, composed: true, clientX: x, clientY: y }),
+  ];
+
+  for (const event of events) {
+    element.dispatchEvent(event);
   }
 
-  // Dispatch pointer events (for modern frameworks)
-  element.dispatchEvent(createPointerEvent('pointerover', element, coords));
-  element.dispatchEvent(createPointerEvent('pointerenter', element, coords));
-  element.dispatchEvent(createPointerEvent('pointerdown', element, coords));
+  // Native click
+  el.click?.();
 
-  // Dispatch mouse events
-  element.dispatchEvent(createMouseEvent('mouseover', element, coords));
-  element.dispatchEvent(createMouseEvent('mouseenter', element, coords));
-  element.dispatchEvent(createMouseEvent('mousedown', element, coords));
-  element.dispatchEvent(createMouseEvent('mouseup', element, coords));
-  element.dispatchEvent(createMouseEvent('click', element, coords));
-
-  // Dispatch pointer up
-  element.dispatchEvent(createPointerEvent('pointerup', element, coords));
-
-  // Handle checkboxes and radio buttons specifically
-  if (element instanceof HTMLInputElement) {
-    if (element.type === 'checkbox') {
-      element.checked = !element.checked;
-      element.dispatchEvent(new Event('change', { bubbles: true }));
-      element.dispatchEvent(new Event('input', { bubbles: true }));
-    } else if (element.type === 'radio') {
-      element.checked = true;
-      element.dispatchEvent(new Event('change', { bubbles: true }));
-      element.dispatchEvent(new Event('input', { bubbles: true }));
-    }
-  }
-
-  // For Google Forms and similar: look for clickable parent or associated label
-  const label = element.closest('label') || document.querySelector(`label[for="${element.id}"]`);
-  if (label && label !== element) {
-    label.dispatchEvent(createMouseEvent('click', label, getElementCenter(label)));
-  }
-
-  // Also try native click (catches cases the events miss)
-  if (htmlElement.click) {
-    htmlElement.click();
-  }
-
-  // For divs/spans that act as buttons (common in Google Forms)
-  if (element.getAttribute('role') === 'radio' || element.getAttribute('role') === 'checkbox') {
-    // Toggle aria-checked for custom controls
-    const currentState = element.getAttribute('aria-checked');
-    if (currentState === 'false') {
-      element.setAttribute('aria-checked', 'true');
-    } else if (currentState === 'true' && element.getAttribute('role') === 'checkbox') {
-      element.setAttribute('aria-checked', 'false');
-    }
+  // Handle checkbox/radio
+  if (el instanceof HTMLInputElement && (el.type === 'checkbox' || el.type === 'radio')) {
+    const newState = el.type === 'radio' ? true : !el.checked;
+    el.checked = newState;
+    el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
   }
 }
 
-// Simulate typing into an input with proper event sequence for React/Vue/Angular
 function simulateInput(element: Element, value: string): void {
-  const htmlElement = element as HTMLElement;
+  const el = element as HTMLElement;
+  el.scrollIntoView({ behavior: 'instant', block: 'center' });
 
-  // Focus the element
-  if (htmlElement.focus) {
-    htmlElement.focus();
-  }
-  element.dispatchEvent(new FocusEvent('focus', { bubbles: true }));
-  element.dispatchEvent(new FocusEvent('focusin', { bubbles: true }));
+  console.log('Flow Recorder: Inputting value:', value);
 
-  if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
-    // Clear existing value first
-    element.value = '';
-    element.dispatchEvent(new Event('input', { bubbles: true }));
+  // Click to focus
+  el.click?.();
+  el.focus?.();
 
-    // Type character by character for better framework compatibility
-    for (let i = 0; i < value.length; i++) {
-      const char = value[i];
+  // Find the actual input element
+  let input: HTMLInputElement | HTMLTextAreaElement | null = null;
 
-      // Keydown
-      element.dispatchEvent(new KeyboardEvent('keydown', {
-        key: char,
-        code: `Key${char.toUpperCase()}`,
-        charCode: char.charCodeAt(0),
-        keyCode: char.charCodeAt(0),
-        which: char.charCodeAt(0),
-        bubbles: true,
-        cancelable: true,
-      }));
-
-      // Update value
-      element.value = value.substring(0, i + 1);
-
-      // Input event with inputType (important for React)
-      const inputEvent = new InputEvent('input', {
-        bubbles: true,
-        cancelable: true,
-        inputType: 'insertText',
-        data: char,
-      });
-      element.dispatchEvent(inputEvent);
-
-      // Keyup
-      element.dispatchEvent(new KeyboardEvent('keyup', {
-        key: char,
-        code: `Key${char.toUpperCase()}`,
-        charCode: char.charCodeAt(0),
-        keyCode: char.charCodeAt(0),
-        which: char.charCodeAt(0),
-        bubbles: true,
-        cancelable: true,
-      }));
-    }
-
-    // Final change event
-    element.dispatchEvent(new Event('change', { bubbles: true }));
-
-    // Try to set value using native setter (bypasses React's synthetic events)
-    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-      window.HTMLInputElement.prototype,
-      'value'
-    )?.set;
-    const nativeTextAreaValueSetter = Object.getOwnPropertyDescriptor(
-      window.HTMLTextAreaElement.prototype,
-      'value'
-    )?.set;
-
-    if (element instanceof HTMLInputElement && nativeInputValueSetter) {
-      nativeInputValueSetter.call(element, value);
-      element.dispatchEvent(new Event('input', { bubbles: true }));
-    } else if (element instanceof HTMLTextAreaElement && nativeTextAreaValueSetter) {
-      nativeTextAreaValueSetter.call(element, value);
-      element.dispatchEvent(new Event('input', { bubbles: true }));
+  if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+    input = el;
+  } else {
+    // Search in element and its shadow root
+    input = el.querySelector('input, textarea') as HTMLInputElement | HTMLTextAreaElement;
+    if (!input && (el as HTMLElement).shadowRoot) {
+      input = (el as HTMLElement).shadowRoot!.querySelector('input, textarea') as HTMLInputElement | HTMLTextAreaElement;
     }
   }
 
-  // Handle contenteditable divs (used in some modern editors)
-  if (htmlElement.contentEditable === 'true') {
-    htmlElement.textContent = value;
-    element.dispatchEvent(new Event('input', { bubbles: true }));
-    element.dispatchEvent(new Event('change', { bubbles: true }));
+  if (!input) {
+    console.log('Flow Recorder: No input element found, trying active element');
+    const active = document.activeElement;
+    if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) {
+      input = active;
+    }
+  }
+
+  if (input) {
+    input.focus();
+
+    // Use native setter to bypass framework proxies
+    const proto = input instanceof HTMLInputElement ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+
+    if (setter) {
+      setter.call(input, '');
+      input.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+      setter.call(input, value);
+    } else {
+      input.value = value;
+    }
+
+    input.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+
+    console.log('Flow Recorder: Value set to:', input.value);
+  } else {
+    console.error('Flow Recorder: Could not find input element');
   }
 }
 
-// Simulate select change
 function simulateSelect(element: Element, value: string): void {
   if (element instanceof HTMLSelectElement) {
-    // Focus first
     element.focus();
-
-    // Find and select the option
     for (let i = 0; i < element.options.length; i++) {
       if (element.options[i].value === value || element.options[i].text === value) {
         element.selectedIndex = i;
         break;
       }
     }
-
-    // Dispatch events
-    element.dispatchEvent(new Event('change', { bubbles: true }));
-    element.dispatchEvent(new Event('input', { bubbles: true }));
+    element.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
   }
 }
 
-// Simulate keypress
 function simulateKeypress(element: Element, key: string): void {
-  const keyCode = key.charCodeAt(0);
-  const specialKeyCodes: Record<string, number> = {
-    'Enter': 13,
-    'Tab': 9,
-    'Escape': 27,
-    'Backspace': 8,
-    'Delete': 46,
-    'ArrowUp': 38,
-    'ArrowDown': 40,
-    'ArrowLeft': 37,
-    'ArrowRight': 39,
-  };
-
-  const code = specialKeyCodes[key] || keyCode;
-
-  const eventInit = {
-    key,
-    code: specialKeyCodes[key] ? key : `Key${key.toUpperCase()}`,
-    keyCode: code,
-    which: code,
-    charCode: code,
-    bubbles: true,
-    cancelable: true,
-  };
+  const keyCode = key === 'Enter' ? 13 : key === 'Tab' ? 9 : key === 'Escape' ? 27 : key.charCodeAt(0);
+  const eventInit = { key, code: key, keyCode, which: keyCode, bubbles: true, cancelable: true, composed: true };
 
   element.dispatchEvent(new KeyboardEvent('keydown', eventInit));
   element.dispatchEvent(new KeyboardEvent('keypress', eventInit));
   element.dispatchEvent(new KeyboardEvent('keyup', eventInit));
 
-  // For Enter key on forms, also try to submit
   if (key === 'Enter') {
     const form = element.closest('form');
-    if (form) {
-      form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
-    }
-  }
-
-  // For Tab, try to move focus
-  if (key === 'Tab') {
-    const focusableElements = document.querySelectorAll(
-      'input, button, select, textarea, a[href], [tabindex]:not([tabindex="-1"])'
-    );
-    const currentIndex = Array.from(focusableElements).indexOf(element as HTMLElement);
-    if (currentIndex >= 0 && currentIndex < focusableElements.length - 1) {
-      (focusableElements[currentIndex + 1] as HTMLElement).focus();
-    }
+    form?.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
   }
 }
 
-// Simulate scroll
 function simulateScroll(position: { x: number; y: number }): void {
-  window.scrollTo({
-    left: position.x,
-    top: position.y,
-    behavior: 'smooth',
-  });
+  window.scrollTo({ left: position.x, top: position.y, behavior: 'smooth' });
 }
 
-// Execute a single step
+// ============================================================================
+// STEP EXECUTOR
+// ============================================================================
+
 export async function executeStep(step: RecordedStep): Promise<boolean> {
-  // Handle wait step
+  console.log('Flow Recorder: Executing step:', step.type, step);
+
+  // Check for captcha
+  const captcha = detectCaptcha();
+  if (captcha.detected) {
+    const shouldContinue = await showCaptchaAlert(captcha.type || 'CAPTCHA');
+    if (!shouldContinue) return false;
+  }
+
+  // Handle wait and scroll steps
   if (step.type === 'wait' && step.delay) {
-    await new Promise((resolve) => setTimeout(resolve, step.delay));
+    await new Promise(r => setTimeout(r, step.delay));
     return true;
   }
 
-  // Handle scroll step
   if (step.type === 'scroll' && step.scrollPosition) {
     simulateScroll(step.scrollPosition);
     return true;
   }
 
   // Find the target element
-  const element = findElement(step.target);
+  const element = await findElementWithRetry(step.target);
   if (!element) {
-    console.error('Flow Recorder: Element not found for step', step);
+    console.error('Flow Recorder: Element not found');
     return false;
   }
 
-  // Highlight the element
-  const removeHighlight = highlightElement(element);
-
-  // Scroll element into view
-  element.scrollIntoView({ behavior: 'smooth', block: 'center' });
-
-  // Wait a bit for scroll
-  await new Promise((resolve) => setTimeout(resolve, 300));
-
-  // Execute the action
-  switch (step.type) {
-    case 'click':
-      simulateClick(element, step.position);
-      break;
-
-    case 'input':
-      if (step.value !== undefined) {
-        simulateInput(element, step.value);
-      }
-      break;
-
-    case 'select':
-      if (step.value !== undefined) {
-        simulateSelect(element, step.value);
-      }
-      break;
-
-    case 'keypress':
-      if (step.value) {
-        simulateKeypress(element, step.value);
-      }
-      break;
-
-    default:
-      console.warn('Flow Recorder: Unknown step type', step.type);
+  // Wait for element to be visible
+  const visible = await waitForVisible(element);
+  if (!visible) {
+    console.warn('Flow Recorder: Element not visible, proceeding anyway');
   }
 
-  // Remove highlight after a short delay
-  setTimeout(removeHighlight, 500);
+  // Highlight element
+  const removeHighlight = highlightElement(element);
 
+  // Scroll into view
+  element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  await new Promise(r => setTimeout(r, 300));
+
+  // Execute action
+  try {
+    switch (step.type) {
+      case 'click':
+        simulateClick(element, step.position);
+        break;
+      case 'input':
+        if (step.value !== undefined) simulateInput(element, step.value);
+        break;
+      case 'select':
+        if (step.value !== undefined) simulateSelect(element, step.value);
+        break;
+      case 'keypress':
+        if (step.value) simulateKeypress(element, step.value);
+        break;
+    }
+  } catch (error) {
+    console.error('Flow Recorder: Error executing step:', error);
+    removeHighlight();
+    return false;
+  }
+
+  setTimeout(removeHighlight, 500);
+  console.log('Flow Recorder: Step completed');
   return true;
 }
